@@ -1,0 +1,12 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(dir:*)",
+      "Bash(gh auth status:*)",
+      "Bash(git init:*)",
+      "Bash(gh auth login:*)",
+      "Bash(curl:*)",
+      "Bash(git add:*)"
+    ]
+  }
+}
