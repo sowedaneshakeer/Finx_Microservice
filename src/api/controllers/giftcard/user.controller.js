@@ -12,4 +12,31 @@ const getUserDetails = async (req, res) => {
   }
 };
 
-module.exports = { getUserDetails };
+const getDtoneBalance = async (req, res) => {
+  try {
+    const result = await userService.getDtoneBalance();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, provider: 'DTONE', error: error.message });
+  }
+};
+
+const getBillersBalance = async (req, res) => {
+  try {
+    const result = await userService.getBillersBalance();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, provider: 'BILLERS', error: error.message });
+  }
+};
+
+const getPpnBalance = async (req, res) => {
+  try {
+    const result = await userService.getPpnBalance();
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ success: false, provider: 'PPN', error: error.message });
+  }
+};
+
+module.exports = { getUserDetails, getDtoneBalance, getBillersBalance, getPpnBalance };

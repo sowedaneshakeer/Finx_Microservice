@@ -3,6 +3,7 @@ const dtoneProvider = require('../../providers/dtone.provider');
 const billersProvider = require('../../providers/billers.provider');
 const ppnProvider = require('../../providers/ppn.provider');
 const logger = require('../../utils/logger');
+const { decodeProductId } = require('../../utils/providerCodes');
 
 /**
  * Create a transaction routed to the correct provider
@@ -27,7 +28,8 @@ const createTransaction = async ({ provider, ...params }) => {
 
 // ─── GlobeTopper ────────────────────────────────────────────────────────────
 async function createGlobetopperTransaction({ productId, amount, email, firstName, lastName, phoneNumber }) {
-  return await globetopper.createTransaction(productId, amount, {
+  const { rawId } = decodeProductId(productId);
+  return await globetopper.createTransaction(rawId, amount, {
     first_name: firstName,
     last_name: lastName,
     senderPhone: phoneNumber,
@@ -49,7 +51,7 @@ async function createDtoneTransaction(params) {
     autoConfirm, callbackUrl
   } = params;
 
-  const realProductId = String(productId).replace('dtone_', '');
+  const { rawId: realProductId } = decodeProductId(productId);
   const externalId = `EXT-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
 
   const payload = {
@@ -83,12 +85,24 @@ async function createDtoneTransaction(params) {
 
   if (callbackUrl) payload.callback_url = callbackUrl;
 
-  logger.info('DT-One transaction payload', { external_id: externalId, product_id: realProductId });
+  logger.info('DT-One transaction payload', JSON.stringify(payload));
 
   const result = await dtoneProvider.createTransaction(payload);
 
+  // Log raw response keys and PIN data for debugging
+  logger.info('DT-One raw response keys', { keys: Object.keys(result), hasPin: !!result.pin, pinKeys: result.pin ? Object.keys(result.pin) : null });
+  if (result.pin) {
+    logger.info('DT-One PIN data', { code: result.pin.code ? '***present***' : null, serial: result.pin.serial || null, validity: result.pin.validity || null });
+  }
+
   // Normalize response
   const status = result.status?.message || result.status?.class?.message || 'UNKNOWN';
+
+  // Extract PIN/voucher data (returned for PIN_PURCHASE products: eSIM, Gift Cards, PIN vouchers)
+  const pinData = result.pin || null;
+  const benefitsData = result.benefits || [];
+  const productData = result.product || {};
+
   return {
     success: status === 'CONFIRMED' || status === 'COMPLETED',
     transactionId: result.id || externalId,
@@ -97,14 +111,21 @@ async function createDtoneTransaction(params) {
     details: result,
     rawResponse: result,
     // Fields needed by orchestrator for display
-    final_amount: result.prices?.retail?.amount || parseFloat(sourceAmount) || 0,
+    final_amount: result.prices?.retail?.amount || result.destination?.amount || parseFloat(sourceAmount) || result.source?.amount || 0,
     summary: {
-      TotalCustomerCostUSD: result.prices?.retail?.amount || 0,
+      TotalCustomerCostUSD: result.prices?.retail?.amount || result.destination?.amount || 0,
     },
     operator: {
       name: result.product?.name || result.operator?.name || '',
       id: realProductId
-    }
+    },
+    // PIN/voucher delivery data (for PIN_PURCHASE products)
+    pin: pinData,
+    benefits: benefitsData,
+    product: productData,
+    prices: result.prices || null,
+    // Delivery metadata (passed through from orchestrator for future email use)
+    deliveryEmail: params.deliveryEmail || '',
   };
 }
 
@@ -123,7 +144,7 @@ async function createBillersTransaction(params) {
     billerType,
   } = params;
 
-  const billerId = String(productId).replace('billers_', '');
+  const { rawId: billerId } = decodeProductId(productId);
   const transactionId = `TXN-${Date.now()}-${Math.floor(Math.random() * 10000)}`;
   const entityCustomerId = customerId || `CUST-${Date.now()}`;
 
@@ -261,74 +282,135 @@ function normalizeBillersResponse(result, transactionId, amount, meta = {}) {
   };
 }
 
-// ─── PPN ────────────────────────────────────────────────────────────────────
+// ─── PPN (Prepay Nation / Valuetopup) ───────────────────────────────────────
 async function createPpnTransaction(params) {
   const {
     productId, // ppn_XXXX
     ppnCategory,
     amount, mobile, accountNumber, recipient,
     simNumber, zipCode, email,
-    countryCode,
+    firstName, lastName,
+    transactionCurrencyCode,
   } = params;
 
-  const skuId = String(productId).replace('ppn_', '');
+  const { rawId: ppnRawId } = decodeProductId(productId);
+  const skuId = parseInt(ppnRawId);
   const correlationId = `TXN-${(ppnCategory || 'GC').toUpperCase()}-${skuId}-${Date.now()}`;
 
   // Route to the correct PPN endpoint based on category
+  // API docs: /api/v2/transaction/topup, /transaction/pin, /transaction/billpay,
+  //           /transaction/giftcard/order, /transaction/sim/activate, /esim/order
   const category = (ppnCategory || 'giftcard').toLowerCase();
   let endpoint = '';
-  let payload = { skuId, countryCode, correlationId };
+  let payload = { skuId, correlationId };
 
   switch (category) {
     case 'pin':
-      endpoint = 'transactions/pin';
-      payload.recipient = recipient || mobile;
+      endpoint = 'transaction/pin';
+      if (recipient || mobile) payload.recipient = recipient || mobile;
       break;
     case 'rtr':
-      endpoint = 'transactions/topup';
+      endpoint = 'transaction/topup';
       payload.amount = parseFloat(amount);
       payload.mobile = mobile;
+      if (transactionCurrencyCode) payload.transactionCurrencyCode = transactionCurrencyCode;
       break;
     case 'billpay':
-      endpoint = 'transactions/billpayment';
+      endpoint = 'transaction/billpay';
       payload.amount = parseFloat(amount);
       payload.accountNumber = accountNumber;
+      if (transactionCurrencyCode) payload.transactionCurrencyCode = transactionCurrencyCode;
       break;
     case 'sim':
-      endpoint = 'transactions/sim';
+      endpoint = 'transaction/sim/activate';
       payload.simNumber = simNumber;
-      payload.zipCode = zipCode;
-      payload.email = email;
+      payload.zipCode = parseInt(zipCode) || 0;
+      if (email) payload.email = email;
       break;
     case 'esim':
-      endpoint = 'transactions/esim';
+      endpoint = 'esim/order';
       break;
     default: // gift card
-      endpoint = 'transactions/giftcard';
+      endpoint = 'transaction/giftcard/order';
       if (amount) payload.amount = parseFloat(amount);
+      if (firstName) payload.firstName = firstName;
+      if (lastName) payload.lastName = lastName;
+      if (recipient || mobile) payload.recipient = recipient || mobile;
+      if (transactionCurrencyCode) payload.transactionCurrencyCode = transactionCurrencyCode;
       break;
   }
 
-  logger.info('PPN transaction', { endpoint, correlationId, category });
+  logger.info('PPN transaction', { endpoint, correlationId, category, payload: JSON.stringify(payload) });
   const result = await ppnProvider.createTransaction(endpoint, payload);
 
-  // Normalize response
-  const isSuccess = result?.status === 'success' || result?.success === true || result?.ResponseCode === '0';
+  // PPN response format: { responseCode: "000", responseMessage: null, payLoad: {...} }
+  // responseCode "000" = success, anything else = failure
+  const responseCode = result?.responseCode;
+  const isSuccess = responseCode === '000';
+  const pay = result?.payLoad || {};
+
+  logger.info('PPN transaction result', {
+    responseCode,
+    isSuccess,
+    transactionId: pay.transactionId,
+    invoiceAmount: pay.invoiceAmount,
+    hasPins: !!(pay.pins && pay.pins.length),
+    hasGiftCard: !!pay.giftCardDetail,
+    hasEsim: !!pay.esimDetail,
+  });
+
+  // For gift cards, fetch card details (cardNumber, pin, expirationDate, certificateLink)
+  let giftCardInfo = null;
+  if (isSuccess && category === 'giftcard' && pay.transactionId) {
+    try {
+      const gcResult = await ppnProvider.fetchGiftCardInfo(pay.transactionId);
+      if (gcResult?.responseCode === '000' && gcResult?.payLoad) {
+        giftCardInfo = gcResult.payLoad;
+        logger.info('PPN gift card info fetched', { transactionId: pay.transactionId, hasCardNumber: !!giftCardInfo.cardNumber });
+      }
+    } catch (gcErr) {
+      logger.warn('PPN: could not fetch gift card info', { transactionId: pay.transactionId, error: gcErr.message });
+    }
+  }
+
+  // If failed, build error info
+  if (!isSuccess) {
+    const errMsg = result?.responseMessage || 'Transaction failed';
+    logger.warn('PPN transaction failed', { responseCode, responseMessage: errMsg, correlationId });
+    const err = new Error(JSON.stringify({ code: `PPN_${responseCode}`, message: errMsg }));
+    err.ppnResponseCode = responseCode;
+    err.ppnResponseMessage = errMsg;
+    throw err;
+  }
+
   return {
-    success: isSuccess,
-    transactionId: result?.transactionId || result?.correlationId || correlationId,
+    success: true,
+    transactionId: pay.transactionId || correlationId,
     externalId: correlationId,
-    status: isSuccess ? 'completed' : 'failed',
-    details: result,
+    status: 'completed',
+    details: pay,
     rawResponse: result,
-    final_amount: parseFloat(amount) || 0,
+    final_amount: pay.invoiceAmount || parseFloat(amount) || 0,
     summary: {
-      TotalCustomerCostUSD: parseFloat(amount) || 0,
+      TotalCustomerCostUSD: pay.invoiceAmount || parseFloat(amount) || 0,
     },
     operator: {
-      name: result?.productName || '',
-      id: skuId
-    }
+      name: pay.product?.productName || pay.product?.operatorName || '',
+      id: String(skuId),
+    },
+    // PPN-specific data for display
+    ppnPayload: pay,
+    pins: pay.pins || [],
+    giftCardDetail: giftCardInfo || pay.giftCardDetail || null,
+    esimDetail: pay.esimDetail || null,
+    topupDetail: pay.topupDetail || null,
+    simInfo: pay.simInfo || null,
+    billPaymentDetail: pay.billPaymentDetail || null,
+    invoiceAmount: pay.invoiceAmount || 0,
+    faceValue: pay.faceValue || 0,
+    discount: pay.discount || 0,
+    fee: pay.fee || 0,
+    transactionDate: pay.transactionDate || '',
   };
 }
 

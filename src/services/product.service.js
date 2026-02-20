@@ -5,10 +5,38 @@ const dtoneProvider = require('../providers/dtone.provider');
 const ppnProvider = require('../providers/ppn.provider');
 const billersProvider = require('../providers/billers.provider');
 const logger = require('../utils/logger');
+const { encodeProductId, decodeProductId, PROVIDER_TO_CODE } = require('../utils/providerCodes');
 
 // ─── Disk-Persisted Cache ────────────────────────────────────────────────────
 const CACHE_DIR = path.join(__dirname, '../../cache');
 const CACHE_FILE = path.join(CACHE_DIR, 'products_cache.json');
+
+/**
+ * Migrate cached products to use new numeric-code IDs (e.g. billers_xxx → 1003_xxx).
+ * This ensures disk cache saved by old code is automatically upgraded on load.
+ */
+function migrateCacheProducts(products) {
+  let migrated = 0;
+  const result = products.map(p => {
+    const billerID = p.BillerID || '';
+    // Check if BillerID uses an old provider-name prefix (e.g. billers_, dtone_, ppn_)
+    const encoded = encodeProductId(billerID);
+    if (encoded !== billerID) {
+      migrated++;
+      const updated = { ...p, BillerID: encoded };
+      if (updated.topup_product_id) updated.topup_product_id = encodeProductId(updated.topup_product_id);
+      if (updated.operator && updated.operator.id) {
+        updated.operator = { ...updated.operator, id: encoded };
+      }
+      return updated;
+    }
+    return p;
+  });
+  if (migrated > 0) {
+    logger.info(`Migrated ${migrated} products from old ID format to numeric codes`);
+  }
+  return result;
+}
 
 /**
  * Load cache from disk on startup — provides instant availability of all products
@@ -26,7 +54,7 @@ function loadCacheFromDisk() {
     for (const provider of ['globetopper', 'dtone', 'ppn', 'billers']) {
       if (saved[provider] && Array.isArray(saved[provider].products) && saved[provider].products.length > 0) {
         productCache[provider] = {
-          products: saved[provider].products,
+          products: migrateCacheProducts(saved[provider].products),
           timestamp: Date.now()  // Mark as fresh so isCacheReady() returns true
         };
         loaded += saved[provider].products.length;
@@ -84,14 +112,19 @@ function normalizeGlobeTopper(catalogueItems, productsData) {
   const unmatchedProducts = productsData.filter(p => !usedProductIds.has(p.operator?.id));
   const allProducts = [...merged, ...unmatchedProducts];
 
-  return allProducts.map(p => ({
-    ...p,
-    provider: 'globetopper',
-    providerLabel: 'GlobeTopper',
-    productId: String(p.sku || p.id || p.BillerID || ''),
-    productName: p.name || '',
-    topup_product_id: p.topup_product_id || p.operator?.id,
-  }));
+  return allProducts.map(p => {
+    const rawId = String(p.topup_product_id || p.operator?.id || p.sku || p.id || p.BillerID || '');
+    const prefixedId = PROVIDER_TO_CODE['globetopper'] + '_' + rawId;
+    return {
+      ...p,
+      provider: 'globetopper',
+      providerLabel: 'GlobeTopper',
+      productId: rawId,
+      productName: p.name || '',
+      topup_product_id: prefixedId,
+      BillerID: prefixedId,
+    };
+  });
 }
 
 /**
@@ -106,23 +139,53 @@ function normalizeDtOne(products) {
     const countryName = p.operator?.country?.name || '';
     const opName = p.operator?.name || p.name || '';
     const serviceName = p.service?.name || p.type || 'Topup';
-    const prefixedId = 'dtone_' + (p.id || '');
+    const prefixedId = PROVIDER_TO_CODE['dtone'] + '_' + (p.id || '');
 
-    // DT-One: destination.amount is a NUMBER, destination.unit is the currency
-    const destAmount = p.destination?.amount || 0;
+    // DT-One: amounts can be numbers (fixed) or objects {min, max} (ranged)
+    const rawDestAmt = p.destination?.amount;
     const destCurr = p.destination?.unit || '';
-    const sourceAmount = p.source?.amount || 0;
+    const rawSrcAmt = p.source?.amount;
     const sourceCurr = p.source?.unit || '';
-    const retailPrice = p.prices?.retail?.amount || sourceAmount;
+    const rawRetailAmt = p.prices?.retail?.amount;
     const retailCurr = p.prices?.retail?.unit || sourceCurr;
+
+    const isRanged = (typeof rawDestAmt === 'object' && rawDestAmt !== null && rawDestAmt.min !== undefined)
+      || (typeof rawSrcAmt === 'object' && rawSrcAmt !== null && rawSrcAmt.min !== undefined)
+      || (p.type || '').startsWith('RANGED_VALUE');
+
+    let destAmount, sourceAmount, retailPrice;
+    if (isRanged) {
+      const destRange = (typeof rawDestAmt === 'object' && rawDestAmt !== null) ? rawDestAmt : null;
+      const srcRange = (typeof rawSrcAmt === 'object' && rawSrcAmt !== null) ? rawSrcAmt : null;
+      destAmount = destRange ? `${destRange.min}-${destRange.max}` : (typeof rawDestAmt === 'number' ? rawDestAmt : 0);
+      sourceAmount = srcRange ? srcRange.min : (typeof rawSrcAmt === 'number' ? rawSrcAmt : 0);
+      retailPrice = (typeof rawRetailAmt === 'object' && rawRetailAmt !== null) ? rawRetailAmt.min : (typeof rawRetailAmt === 'number' ? rawRetailAmt : sourceAmount);
+    } else {
+      destAmount = (typeof rawDestAmt === 'number') ? rawDestAmt : 0;
+      sourceAmount = (typeof rawSrcAmt === 'number') ? rawSrcAmt : 0;
+      retailPrice = (typeof rawRetailAmt === 'number') ? rawRetailAmt : sourceAmount;
+    }
 
     // Build denomination string
     let denomination = '';
-    if (destAmount) {
+    if (isRanged) {
+      const dRange = (typeof rawDestAmt === 'object' && rawDestAmt !== null) ? rawDestAmt : null;
+      if (dRange) {
+        denomination = `${dRange.min} - ${dRange.max} ${destCurr}`;
+      } else {
+        const sRange = (typeof rawSrcAmt === 'object' && rawSrcAmt !== null) ? rawSrcAmt : null;
+        denomination = sRange ? `${sRange.min} - ${sRange.max} ${sourceCurr}` : '';
+      }
+    } else if (destAmount) {
       denomination = `${destAmount} ${destCurr}`;
     } else if (retailPrice) {
       denomination = `${retailPrice} ${retailCurr}`;
     }
+
+    const minDisplay = isRanged ? String(retailPrice || sourceAmount) : String(retailPrice || destAmount);
+    const maxDisplay = isRanged
+      ? String((typeof rawRetailAmt === 'object' && rawRetailAmt !== null) ? rawRetailAmt.max : (typeof rawSrcAmt === 'object' && rawSrcAmt !== null) ? rawSrcAmt.max : retailPrice || destAmount)
+      : String(retailPrice || destAmount);
 
     return {
       ...p,
@@ -145,43 +208,68 @@ function normalizeDtOne(products) {
       category: { id: 1001, name: serviceName, description: serviceName },
       type: { id: 1001, name: p.type || serviceName },
       currency: { code: destCurr || retailCurr, name: destCurr || retailCurr },
-      min: String(retailPrice || destAmount),
-      max: String(retailPrice || destAmount),
-      denominations: destAmount ? [destAmount] : [],
+      min: minDisplay,
+      max: maxDisplay,
+      denominations: (!isRanged && destAmount) ? [destAmount] : [],
       denomination,
       user_display: denomination,
       card_image: p.operator?.logo_url || null,
       imageUrl: p.operator?.logo_url || null,
+      dtoneIsRanged: isRanged,
     };
   });
 }
 
 /**
  * Normalize PPN product to orchestrator format
+ *
+ * PPN API returns min/max as objects:
+ *   { faceValue, faceValueCurrency, deliveredAmount, deliveryCurrencyCode, cost, costCurrency, faceValueInWalletCurrency }
+ * category is a plain string, imageUrl is the logo field, and there is no country name (only countryCode).
  */
 function normalizePpn(data) {
   const products = Array.isArray(data) ? data : (data?.payLoad || data?.skus || data?.data || []);
 
   return products.map(p => {
     const skuCode = p.SkuCode || p.skuId || p.sku_code || p.id || '';
-    const prefixedId = 'ppn_' + skuCode;
+    const prefixedId = PROVIDER_TO_CODE['ppn'] + '_' + skuCode;
     const productName = p.ProductName || p.productName || p.product_name || p.name || '';
     const brandName = p.Brand || p.brand || p.OperatorName || p.operatorName || '';
     const countryCode = p.CountryCode || p.countryCode || p.country_code || '';
-    const countryName = p.Country || p.country || '';
-    const currencyCode = p.Currency || p.currency || '';
-    const categoryName = p.Category || p.category || 'Topup';
+    const countryName = p.Country || p.country || COUNTRY_NAME_MAP[countryCode] || countryCode;
+
+    // PPN min/max can be objects with { faceValue, faceValueCurrency, ... } or simple numbers
+    const minObj = p.MinAmount || p.minAmount || p.min || 0;
+    const maxObj = p.MaxAmount || p.maxAmount || p.max || 0;
+    const minAmt = (typeof minObj === 'object' && minObj !== null) ? (minObj.faceValue || minObj.deliveredAmount || 0) : Number(minObj) || 0;
+    const maxAmt = (typeof maxObj === 'object' && maxObj !== null) ? (maxObj.faceValue || maxObj.deliveredAmount || 0) : Number(maxObj) || 0;
+
+    // Extract currency from min/max objects or from explicit fields
+    const currencyFromMin = (typeof minObj === 'object' && minObj !== null) ? (minObj.faceValueCurrency || minObj.deliveryCurrencyCode || '') : '';
+    const currencyCode = p.Currency || p.currency || currencyFromMin || COUNTRY_CURRENCY_MAP[countryCode] || '';
+
+    // category can be a plain string from PPN API
+    const rawCategory = p.Category || p.category || 'Topup';
+    const categoryName = (typeof rawCategory === 'string') ? rawCategory : (rawCategory?.name || 'Topup');
     const typeName = p.Type || p.type || categoryName;
-    const logoUrl = p.LogoUrl || p.logoUrl || p.logo_url || p.ImageUrl || null;
-    const minAmt = p.MinAmount || p.minAmount || p.min || 0;
-    const maxAmt = p.MaxAmount || p.maxAmount || p.max || 0;
+
+    // PPN uses imageUrl for logos
+    const logoUrl = p.LogoUrl || p.logoUrl || p.logo_url || p.ImageUrl || p.imageUrl || null;
+
     const fixedAmounts = p.FixedAmounts || p.fixedAmounts || p.denominations || [];
 
     let denomination = '';
     if (fixedAmounts.length > 0) {
       denomination = fixedAmounts.map(a => `${a} ${currencyCode}`).join(', ');
-    } else if (minAmt && maxAmt) {
+    } else if (minAmt && maxAmt && minAmt !== maxAmt) {
       denomination = `${minAmt} - ${maxAmt} ${currencyCode}`;
+    } else if (minAmt) {
+      denomination = `${minAmt} ${currencyCode}`;
+    }
+
+    // Use skuName as fallback for denomination (e.g. "AT&T PIN US 15.00 USD")
+    if (!denomination && p.skuName) {
+      denomination = p.skuName;
     }
 
     return {
@@ -261,7 +349,7 @@ function normalizeBillers(data) {
 
   return billers.map(p => {
     const billerId = p.BillerID || p.billerId || p.id || '';
-    const prefixedId = 'billers_' + billerId;
+    const prefixedId = PROVIDER_TO_CODE['billers'] + '_' + billerId;
     const billerName = p.BillerName || p.billerName || p.name || '';
     const rawCountryCode = p.CountryCode || p.countryCode || '';
     const countryCode = rawCountryCode;
@@ -377,6 +465,8 @@ async function warmUpCache() {
       logger.info(`Cache warmed: DT-One = ${productCache.dtone.products.length} products`);
     } else {
       logger.warn(`DT-One warm-up returned fewer products (${allDtProducts.length}) than cached (${existingCount}), keeping existing cache`);
+      // Ensure existing cache uses new ID format
+      productCache.dtone.products = migrateCacheProducts(productCache.dtone.products);
     }
   } catch (err) {
     logger.warn('Cache warm-up failed: DT-One', { error: err.message });
@@ -391,6 +481,8 @@ async function warmUpCache() {
       logger.info(`Cache warmed: Billers = ${productCache.billers.products.length} products`);
     } else {
       logger.warn(`Billers warm-up returned fewer products (${allBillers.length}) than cached (${existingBillersCount}), keeping existing cache`);
+      // Ensure existing cache uses new ID format
+      productCache.billers.products = migrateCacheProducts(productCache.billers.products);
     }
   } catch (err) {
     logger.warn('Cache warm-up failed: Billers', { error: err.message });
@@ -670,14 +762,16 @@ const getAllProducts = async (filters = {}) => {
 
 /**
  * Get a single product by ID - routes to correct provider based on prefix
- * IDs: dtone_123, billers_456, ppn_789, or plain ID for GlobeTopper
+ * Accepts numeric codes (1002_123) or old prefixes (dtone_123) or plain IDs (GlobeTopper)
  */
 const getProductById = async (id) => {
   const idStr = String(id);
+  const decoded = decodeProductId(idStr);
+  const encodedId = encodeProductId(idStr);
 
   // DT-One product
-  if (idStr.startsWith('dtone_')) {
-    const realId = idStr.replace('dtone_', '');
+  if (decoded.provider === 'dtone') {
+    const realId = decoded.rawId;
     try {
       const p = await dtoneProvider.getProductById(realId);
       const countryIso = p.operator?.country?.iso_code || '';
@@ -685,26 +779,64 @@ const getProductById = async (id) => {
       const opName = p.operator?.name || p.name || '';
       const serviceName = p.service?.name || p.type || 'Topup';
 
-      const destAmount = p.destination?.amount || 0;
+      // DT-One: amounts can be simple numbers (fixed) or objects {min, max} (ranged)
+      const rawDestAmt = p.destination?.amount;
       const destCurr = p.destination?.unit || '';
-      const sourceAmount = p.source?.amount || 0;
+      const rawSrcAmt = p.source?.amount;
       const sourceCurr = p.source?.unit || '';
-      const retailPrice = p.prices?.retail?.amount || sourceAmount;
+      const rawRetailAmt = p.prices?.retail?.amount;
       const retailCurr = p.prices?.retail?.unit || sourceCurr;
+
+      // Detect ranged products: amount fields are objects with min/max
+      const isRangeProduct = (typeof rawDestAmt === 'object' && rawDestAmt !== null && rawDestAmt.min !== undefined)
+        || (typeof rawSrcAmt === 'object' && rawSrcAmt !== null && rawSrcAmt.min !== undefined)
+        || (p.type || '').startsWith('RANGED_VALUE');
+      const productType = p.type || '';
+
+      // Extract numeric amounts (for fixed products) or min/max (for ranged)
+      let destAmount, sourceAmount, retailPrice;
+      let rangeMin = 0, rangeMax = 0, rangeIncrement = 1;
+
+      if (isRangeProduct) {
+        // Ranged: extract min/max from destination or source
+        const destRange = (typeof rawDestAmt === 'object' && rawDestAmt !== null) ? rawDestAmt : null;
+        const srcRange = (typeof rawSrcAmt === 'object' && rawSrcAmt !== null) ? rawSrcAmt : null;
+        const retailRange = (typeof rawRetailAmt === 'object' && rawRetailAmt !== null) ? rawRetailAmt : null;
+        destAmount = destRange ? destRange.min : (typeof rawDestAmt === 'number' ? rawDestAmt : 0);
+        sourceAmount = srcRange ? srcRange.min : (typeof rawSrcAmt === 'number' ? rawSrcAmt : 0);
+        retailPrice = retailRange ? retailRange.min : (typeof rawRetailAmt === 'number' ? rawRetailAmt : sourceAmount);
+        // Use source range for price range (what user pays)
+        if (srcRange) {
+          rangeMin = srcRange.min || 0;
+          rangeMax = srcRange.max || 0;
+          rangeIncrement = srcRange.increment || destRange?.increment || 1;
+        } else if (destRange) {
+          rangeMin = destRange.min || 0;
+          rangeMax = destRange.max || 0;
+          rangeIncrement = destRange.increment || 1;
+        }
+      } else {
+        // Fixed: amounts are simple numbers
+        destAmount = (typeof rawDestAmt === 'number') ? rawDestAmt : 0;
+        sourceAmount = (typeof rawSrcAmt === 'number') ? rawSrcAmt : 0;
+        retailPrice = (typeof rawRetailAmt === 'number') ? rawRetailAmt : sourceAmount;
+      }
+
       const curr = destCurr || retailCurr;
 
       let denomination = '';
-      if (destAmount) {
+      if (isRangeProduct) {
+        const dRange = (typeof rawDestAmt === 'object' && rawDestAmt !== null) ? rawDestAmt : null;
+        if (dRange) {
+          denomination = `${dRange.min} - ${dRange.max} ${destCurr}`;
+        } else {
+          denomination = `${rangeMin} - ${rangeMax} ${sourceCurr}`;
+        }
+      } else if (destAmount) {
         denomination = `${destAmount} ${destCurr}`;
       } else if (retailPrice) {
         denomination = `${retailPrice} ${retailCurr}`;
       }
-
-      // Determine product characteristics
-      const benefitMin = p.benefits?.[0]?.amount?.range?.min || p.source?.amount || 0;
-      const benefitMax = p.benefits?.[0]?.amount?.range?.max || p.source?.amount || 0;
-      const isRangeProduct = benefitMin !== benefitMax && benefitMax > 0;
-      const productType = p.type || '';
 
       // Collect required fields from product AND service level
       const requiredCreditFields = p.required_credit_party_identifier_fields || p.service?.required_credit_party_identifier_fields || [];
@@ -724,9 +856,9 @@ const getProductById = async (id) => {
         ...p,
         provider: 'dtone',
         providerLabel: 'DT-One',
-        id: idStr,
-        operatorId: idStr,
-        topup_product_id: idStr,
+        id: encodedId,
+        operatorId: encodedId,
+        topup_product_id: encodedId,
         name: p.name || opName,
         brand: opName,
         description: p.description || p.name || '',
@@ -743,9 +875,9 @@ const getProductById = async (id) => {
         redemption_instruction: '',
         term_and_conditions: '',
         priceRange: {
-          min: isRangeProduct ? parseFloat(benefitMin) : (parseFloat(retailPrice || destAmount) || 0),
-          max: isRangeProduct ? parseFloat(benefitMax) : (parseFloat(retailPrice || destAmount) || 0),
-          increment: isRangeProduct ? (p.benefits?.[0]?.amount?.range?.step || 1) : 1,
+          min: isRangeProduct ? rangeMin : (parseFloat(retailPrice || destAmount) || 0),
+          max: isRangeProduct ? rangeMax : (parseFloat(retailPrice || destAmount) || 0),
+          increment: isRangeProduct ? rangeIncrement : 1,
           isRange: isRangeProduct
         },
         // DT-One specific transaction metadata
@@ -766,7 +898,7 @@ const getProductById = async (id) => {
         dtoneRequiredAdditionalFields: requiredAdditionalFields,
         dtoneService: p.service || null,
         operator: {
-          id: idStr,
+          id: encodedId,
           name: opName,
           logo_url: p.operator?.logo_url || null,
           country: { iso2: countryIso, name: countryName, currency: { code: curr, name: curr } }
@@ -779,8 +911,8 @@ const getProductById = async (id) => {
   }
 
   // Billers product
-  if (idStr.startsWith('billers_')) {
-    const realId = idStr.replace('billers_', '');
+  if (decoded.provider === 'billers') {
+    const realId = decoded.rawId;
     try {
       // Get biller info from catalog
       const billersData = await billersProvider.getBillers({ BillerID: realId });
@@ -848,9 +980,9 @@ const getProductById = async (id) => {
         ...biller,
         provider: 'billers',
         providerLabel: 'Billers',
-        id: idStr,
-        operatorId: idStr,
-        topup_product_id: idStr,
+        id: encodedId,
+        operatorId: encodedId,
+        topup_product_id: encodedId,
         billerRealId: realId,
         name: biller.BillerName || '',
         brand: biller.BillerName || '',
@@ -878,7 +1010,7 @@ const getProductById = async (id) => {
         BillerSubType: biller.BillerSubType || '',
         BackendFee: biller.BackendFee || 0,
         operator: {
-          id: idStr,
+          id: encodedId,
           name: biller.BillerName || '',
           logo_url: biller.Logo || null,
           country: { iso2: billerCountry, name: billerCountryName }
@@ -892,8 +1024,8 @@ const getProductById = async (id) => {
   }
 
   // PPN product
-  if (idStr.startsWith('ppn_')) {
-    const realId = idStr.replace('ppn_', '');
+  if (decoded.provider === 'ppn') {
+    const realId = decoded.rawId;
     try {
       const data = await ppnProvider.getProductById(realId);
       const products = Array.isArray(data) ? data : (data?.payLoad || data?.skus || data?.data || []);
@@ -902,31 +1034,47 @@ const getProductById = async (id) => {
       if (!p) return null;
 
       const productName = p.ProductName || p.productName || p.name || '';
-      const brandName = p.Brand || p.brand || p.OperatorName || '';
-      const currencyCode = p.Currency || p.currency || '';
-      const minAmt = p.MinAmount || p.minAmount || 0;
-      const maxAmt = p.MaxAmount || p.maxAmount || 0;
+      const brandName = p.Brand || p.brand || p.OperatorName || p.operatorName || '';
+
+      // PPN min/max can be objects with { faceValue, faceValueCurrency, ... }
+      const minObj = p.MinAmount || p.minAmount || p.min || 0;
+      const maxObj = p.MaxAmount || p.maxAmount || p.max || 0;
+      const minAmt = (typeof minObj === 'object' && minObj !== null) ? (minObj.faceValue || minObj.deliveredAmount || 0) : Number(minObj) || 0;
+      const maxAmt = (typeof maxObj === 'object' && maxObj !== null) ? (maxObj.faceValue || maxObj.deliveredAmount || 0) : Number(maxObj) || 0;
+
+      const currencyFromMin = (typeof minObj === 'object' && minObj !== null) ? (minObj.faceValueCurrency || minObj.deliveryCurrencyCode || '') : '';
+      const ppnCountryCode = p.CountryCode || p.countryCode || '';
+      const currencyCode = p.Currency || p.currency || currencyFromMin || COUNTRY_CURRENCY_MAP[ppnCountryCode] || '';
+      const countryName = p.Country || p.country || COUNTRY_NAME_MAP[ppnCountryCode] || ppnCountryCode;
+
       const fixedAmounts = p.FixedAmounts || p.fixedAmounts || [];
+      const logoUrl = p.LogoUrl || p.logoUrl || p.logo_url || p.ImageUrl || p.imageUrl || null;
 
       let denomination = '';
       if (fixedAmounts.length > 0) {
         denomination = fixedAmounts.map(a => `${a} ${currencyCode}`).join(', ');
-      } else if (minAmt && maxAmt) {
+      } else if (minAmt && maxAmt && minAmt !== maxAmt) {
         denomination = `${minAmt} - ${maxAmt} ${currencyCode}`;
+      } else if (minAmt) {
+        denomination = `${minAmt} ${currencyCode}`;
+      }
+      if (!denomination && p.skuName) {
+        denomination = p.skuName;
       }
 
       // Build PPN transaction form attributes based on product type
-      const ppnCategory = (p.Category || p.category || '').toLowerCase();
+      const rawCategory = p.Category || p.category || 'Topup';
+      const ppnCategory = (typeof rawCategory === 'string' ? rawCategory : (rawCategory?.name || '')).toLowerCase();
       const ppnType = (p.Type || p.type || '').toLowerCase();
       const ppnAttributes = [];
-      const isRangePpn = !fixedAmounts.length && minAmt && maxAmt && parseFloat(minAmt) !== parseFloat(maxAmt);
+      const isRangePpn = !fixedAmounts.length && minAmt && maxAmt && minAmt !== maxAmt;
 
       if (isRangePpn) {
         ppnAttributes.push({ name: 'amount', label: 'Amount', required: true });
       }
       // Topup / Recharge type needs mobile number
       if (ppnCategory.includes('topup') || ppnCategory.includes('recharge') || ppnCategory.includes('mobile') ||
-          ppnType.includes('topup') || ppnType.includes('recharge')) {
+          ppnType.includes('topup') || ppnType.includes('recharge') || ppnCategory.includes('rtr')) {
         ppnAttributes.push({ name: 'mobileNumber', label: 'Mobile Number (with country code)', required: true });
       }
       // Bill Payment / Utility needs account number
@@ -940,51 +1088,84 @@ const getProductById = async (id) => {
       ppnAttributes.push({ name: 'email', label: 'Email Address', required: false });
 
       // Determine PPN transaction category
-      const rawCat = (p.Category || p.category || '').toLowerCase();
       let ppnTxCategory = 'giftcard';
-      if (rawCat.includes('pin')) ppnTxCategory = 'pin';
-      else if (rawCat.includes('topup') || rawCat.includes('recharge') || rawCat.includes('rtr')) ppnTxCategory = 'rtr';
-      else if (rawCat.includes('bill') || rawCat.includes('utility') || rawCat.includes('payment')) ppnTxCategory = 'billpay';
-      else if (rawCat.includes('sim') && !rawCat.includes('esim')) ppnTxCategory = 'sim';
-      else if (rawCat.includes('esim')) ppnTxCategory = 'esim';
-      else if (rawCat.includes('gift')) ppnTxCategory = 'giftcard';
+      if (ppnCategory.includes('pin')) ppnTxCategory = 'pin';
+      else if (ppnCategory.includes('topup') || ppnCategory.includes('recharge') || ppnCategory.includes('rtr')) ppnTxCategory = 'rtr';
+      else if (ppnCategory.includes('bill') || ppnCategory.includes('utility') || ppnCategory.includes('payment')) ppnTxCategory = 'billpay';
+      else if (ppnCategory.includes('sim') && !ppnCategory.includes('esim')) ppnTxCategory = 'sim';
+      else if (ppnCategory.includes('esim')) ppnTxCategory = 'esim';
+      else if (ppnCategory.includes('gift')) ppnTxCategory = 'giftcard';
+
+      const categoryName = typeof rawCategory === 'string' ? rawCategory : (rawCategory?.name || 'Topup');
+
+      // Extract face value / delivered amount details from min object
+      const faceValue = (typeof minObj === 'object' && minObj !== null) ? (minObj.faceValue || 0) : Number(minObj) || 0;
+      const faceValueCurrency = (typeof minObj === 'object' && minObj !== null) ? (minObj.faceValueCurrency || '') : currencyCode;
+      const deliveredAmount = (typeof minObj === 'object' && minObj !== null) ? (minObj.deliveredAmount || 0) : 0;
+      const deliveryCurrencyCode = (typeof minObj === 'object' && minObj !== null) ? (minObj.deliveryCurrencyCode || '') : '';
 
       return {
         ...p,
         provider: 'ppn',
         providerLabel: 'PPN',
-        id: idStr,
-        operatorId: idStr,
-        topup_product_id: idStr,
+        id: encodedId,
+        operatorId: encodedId,
+        topup_product_id: encodedId,
         ppnSkuId: realId,
-        ppnCountryCode: p.CountryCode || p.countryCode || '',
+        ppnCountryCode,
         ppnCategory: ppnTxCategory,
         name: productName,
         brand: brandName || productName,
-        description: p.Description || p.description || productName,
-        brand_description: p.Description || p.description || '',
-        country: p.Country || p.country || '',
-        iso2: p.CountryCode || p.countryCode || '',
-        card_image: p.LogoUrl || p.logoUrl || null,
-        category: { id: 2001, name: p.Category || p.category || 'Topup' },
+        description: p.productDescription || p.Description || p.description || p.additionalInformation || productName,
+        brand_description: p.productDescription || p.Description || p.description || '',
+        country: countryName,
+        iso2: ppnCountryCode,
+        card_image: logoUrl,
+        category: { id: 2001, name: categoryName },
         currency: { code: currencyCode, name: currencyCode },
-        usage: p.Type || p.type || 'Digital',
-        expiration: '',
+        usage: p.Type || p.type || p.deliveryAmountType || 'Digital',
+        expiration: p.validity || '',
         denomination,
         redemptionInfo: denomination,
-        redemption_instruction: '',
+        redemption_instruction: p.additionalInformation || '',
         term_and_conditions: '',
+        min: String(minAmt),
+        max: String(maxAmt),
         priceRange: {
-          min: parseFloat(minAmt) || 0,
-          max: parseFloat(maxAmt) || 0,
-          increment: 1,
+          min: minAmt,
+          max: maxAmt,
+          increment: p.allowDecimal ? 0.01 : 1,
           isRange: isRangePpn
         },
         operator: {
-          id: idStr,
+          id: encodedId,
           name: brandName || productName,
-          logo_url: p.LogoUrl || p.logoUrl || null,
-          country: { iso2: p.CountryCode || '', name: p.Country || '' }
+          logo_url: logoUrl,
+          country: { iso2: ppnCountryCode, name: countryName, currency: { code: currencyCode, name: currencyCode } }
+        },
+        // PPN-specific detail fields
+        ppnDetails: {
+          skuName: p.skuName || '',
+          productId: p.productId || '',
+          operatorId: p.operatorId || '',
+          faceValue,
+          faceValueCurrency,
+          deliveredAmount,
+          deliveryCurrencyCode,
+          exchangeRate: p.exchangeRate || 0,
+          fee: p.fee || 0,
+          salesTax: p.salesTax || 0,
+          isSalesTaxCharged: p.isSalesTaxCharged || false,
+          benefitType: p.benefitType || '',
+          deliveryAmountType: p.deliveryAmountType || '',
+          allowDecimal: p.allowDecimal !== false,
+          localPhoneNumberLength: p.localPhoneNumberLength || 0,
+          internationalCountryCode: p.internationalCountryCode || [],
+          additionalInformation: p.additionalInformation || '',
+          productDescription: p.productDescription || '',
+          validity: p.validity || '',
+          subCategory: p.subCategory || '',
+          requireFetchBundle: p.requireFetchBundle || false,
         }
       };
     } catch (err) {
@@ -996,20 +1177,21 @@ const getProductById = async (id) => {
   // Default: GlobeTopper (no prefix)
   // The listing uses topup_product_id from catalogue, so we must search both
   try {
+    const gtRawId = decoded.rawId;
     const [catalogue, products] = await Promise.all([
       globetopperProvider.getCatalogue({}),
       globetopperProvider.getProducts({})
     ]);
 
     // Search by: topup_product_id (catalogue), BillerID, or operator.id
-    const catItem = catalogue.find(c => c.topup_product_id == id);
+    const catItem = catalogue.find(c => c.topup_product_id == gtRawId);
     let product = products.find(p =>
-      p.BillerID == id || (p.operator && p.operator.id == id)
+      p.BillerID == gtRawId || (p.operator && p.operator.id == gtRawId)
     );
 
     // If found via catalogue, match the corresponding product
     if (catItem && !product) {
-      product = products.find(p => p.operator && p.operator.id == catItem.topup_product_id);
+      product = products.find(p => p.operator && p.operator.id == gtRawId);
     }
 
     const merged = { ...catItem, ...product };
@@ -1045,9 +1227,9 @@ const getProductById = async (id) => {
         ...merged,
         provider: 'globetopper',
         providerLabel: 'GlobeTopper',
-        id: merged.BillerID || id,
-        operatorId: merged.operator?.id || catItem?.topup_product_id || id,
-        topup_product_id: catItem?.topup_product_id || merged.operator?.id || id,
+        id: encodedId,
+        operatorId: encodedId,
+        topup_product_id: encodedId,
         name: merged.name || merged.brand || '',
         brand: merged.brand || merged.name || '',
         description: merged.description || merged.brand_description || '',
@@ -1079,4 +1261,67 @@ const getProductById = async (id) => {
   return null;
 };
 
-module.exports = { getAllProducts, getProductById };
+// ISO3 → ISO2 mapping for country code normalization
+const ISO3_TO_ISO2 = {
+  AFG:'AF',ALB:'AL',DZA:'DZ',ASM:'AS',AND:'AD',AGO:'AO',AIA:'AI',ATG:'AG',ARG:'AR',ARM:'AM',
+  ABW:'AW',AUS:'AU',AUT:'AT',AZE:'AZ',BHS:'BS',BHR:'BH',BGD:'BD',BRB:'BB',BLR:'BY',BEL:'BE',
+  BLZ:'BZ',BEN:'BJ',BMU:'BM',BTN:'BT',BOL:'BO',BIH:'BA',BWA:'BW',BRA:'BR',BRN:'BN',BGR:'BG',
+  BFA:'BF',BDI:'BI',KHM:'KH',CMR:'CM',CAN:'CA',CPV:'CV',CYM:'KY',CAF:'CF',TCD:'TD',CHL:'CL',
+  CHN:'CN',COL:'CO',COM:'KM',COG:'CG',COD:'CD',COK:'CK',CRI:'CR',CIV:'CI',HRV:'HR',CUB:'CU',
+  CUW:'CW',CYP:'CY',CZE:'CZ',DNK:'DK',DJI:'DJ',DMA:'DM',DOM:'DO',ECU:'EC',EGY:'EG',SLV:'SV',
+  GNQ:'GQ',ERI:'ER',EST:'EE',SWZ:'SZ',ETH:'ET',FJI:'FJ',FIN:'FI',FRA:'FR',GUF:'GF',PYF:'PF',
+  GAB:'GA',GMB:'GM',GEO:'GE',DEU:'DE',GHA:'GH',GIB:'GI',GRC:'GR',GRD:'GD',GLP:'GP',GUM:'GU',
+  GTM:'GT',GIN:'GN',GNB:'GW',GUY:'GY',HTI:'HT',HND:'HN',HKG:'HK',HUN:'HU',ISL:'IS',IND:'IN',
+  IDN:'ID',IRN:'IR',IRQ:'IQ',IRL:'IE',ISR:'IL',ITA:'IT',JAM:'JM',JPN:'JP',JOR:'JO',KAZ:'KZ',
+  KEN:'KE',KIR:'KI',PRK:'KP',KOR:'KR',KWT:'KW',KGZ:'KG',LAO:'LA',LVA:'LV',LBN:'LB',LSO:'LS',
+  LBR:'LR',LBY:'LY',LIE:'LI',LTU:'LT',LUX:'LU',MAC:'MO',MDG:'MG',MWI:'MW',MYS:'MY',MDV:'MV',
+  MLI:'ML',MLT:'MT',MHL:'MH',MTQ:'MQ',MRT:'MR',MUS:'MU',MYT:'YT',MEX:'MX',FSM:'FM',MDA:'MD',
+  MCO:'MC',MNG:'MN',MNE:'ME',MSR:'MS',MAR:'MA',MOZ:'MZ',MMR:'MM',NAM:'NA',NRU:'NR',NPL:'NP',
+  NLD:'NL',NCL:'NC',NZL:'NZ',NIC:'NI',NER:'NE',NGA:'NG',NIU:'NU',NFK:'NF',MKD:'MK',MNP:'MP',
+  NOR:'NO',OMN:'OM',PAK:'PK',PLW:'PW',PSE:'PS',PAN:'PA',PNG:'PG',PRY:'PY',PER:'PE',PHL:'PH',
+  POL:'PL',PRT:'PT',PRI:'PR',QAT:'QA',REU:'RE',ROU:'RO',RUS:'RU',RWA:'RW',KNA:'KN',LCA:'LC',
+  VCT:'VC',WSM:'WS',SMR:'SM',STP:'ST',SAU:'SA',SEN:'SN',SRB:'RS',SYC:'SC',SLE:'SL',SGP:'SG',
+  SXM:'SX',SVK:'SK',SVN:'SI',SLB:'SB',SOM:'SO',ZAF:'ZA',ESP:'ES',LKA:'LK',SDN:'SD',SUR:'SR',
+  SWE:'SE',CHE:'CH',SYR:'SY',TWN:'TW',TJK:'TJ',TZA:'TZ',THA:'TH',TLS:'TL',TGO:'TG',TON:'TO',
+  TTO:'TT',TUN:'TN',TUR:'TR',TKM:'TM',TCA:'TC',TUV:'TV',UGA:'UG',UKR:'UA',ARE:'AE',GBR:'GB',
+  USA:'US',URY:'UY',UZB:'UZ',VUT:'VU',VEN:'VE',VNM:'VN',VGB:'VG',VIR:'VI',YEM:'YE',ZMB:'ZM',
+  ZWE:'ZW',XKX:'XK',SSD:'SS',BES:'BQ',MAF:'MF',BLM:'BL',SPM:'PM',WLF:'WF',ESH:'EH',
+};
+
+/**
+ * Get unified country list from ALL provider product caches.
+ * Normalizes ISO3 → ISO2, deduplicates, and returns sorted list.
+ */
+const getUnifiedCountries = () => {
+  const countryMap = new Map(); // keyed by iso2
+
+  for (const provider of ['globetopper', 'dtone', 'ppn', 'billers']) {
+    const products = productCache[provider].products || [];
+    for (const p of products) {
+      let rawIso = p.iso2 || p.countryCode || (p.operator?.country?.iso2) || '';
+      if (!rawIso) continue;
+
+      rawIso = rawIso.toUpperCase().trim();
+      if (rawIso === 'WW' || rawIso === 'WWX' || rawIso === 'XX') continue;
+
+      // Normalize: convert ISO3 to ISO2
+      const iso2 = rawIso.length === 3 ? (ISO3_TO_ISO2[rawIso] || rawIso) : rawIso;
+      const name = p.country || p.operator?.country?.name || '';
+
+      if (countryMap.has(iso2)) {
+        const existing = countryMap.get(iso2);
+        existing.productCount++;
+        // Prefer longer/more descriptive name (not just the ISO code)
+        if (name.length > 2 && name.length > existing.name.length) {
+          existing.name = name;
+        }
+      } else {
+        countryMap.set(iso2, { iso2, name: name.length > 2 ? name : iso2, productCount: 1 });
+      }
+    }
+  }
+
+  return Array.from(countryMap.values()).sort((a, b) => a.name.localeCompare(b.name));
+};
+
+module.exports = { getAllProducts, getProductById, getUnifiedCountries };

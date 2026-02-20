@@ -80,6 +80,10 @@ class DtOneProvider {
     throw new Error('DT-One request failed after ' + MAX_RETRIES + ' retries');
   }
 
+  async getBalances() {
+    return this.sendRequest('balances', 'GET');
+  }
+
   async getProducts(filters = {}) {
     const params = {};
     if (filters.country) params.country_iso_code = filters.country;
@@ -136,8 +140,10 @@ class DtOneProvider {
   }
 
   async createTransaction(payload) {
+    // Step 1: Create via async endpoint
     const url = `${this.baseURL.replace(/\/$/, '')}/async/transactions`;
     let attempts = 0;
+    let asyncResult;
 
     while (attempts < MAX_RETRIES) {
       try {
@@ -152,7 +158,8 @@ class DtOneProvider {
           data: payload,
           timeout: 30000,
         });
-        return response.data;
+        asyncResult = response.data;
+        break;
       } catch (err) {
         const status = err.response?.status;
         if (status === 429) {
@@ -162,15 +169,45 @@ class DtOneProvider {
           await sleep(delay);
           continue;
         }
+        const errBody = err.response?.data;
         logger.error('DT-One createTransaction Error:', {
           status,
           message: err.message,
-          data: err.response?.data
+          errors: errBody?.errors || errBody,
         });
-        throw err;
+        // Attach DT-One error body to the error so it propagates
+        const enrichedErr = new Error(err.message);
+        enrichedErr.response = err.response;
+        enrichedErr.dtoneErrors = errBody?.errors || errBody;
+        throw enrichedErr;
       }
     }
-    throw new Error('DT-One transaction failed after ' + MAX_RETRIES + ' retries');
+
+    if (!asyncResult) {
+      throw new Error('DT-One transaction failed after ' + MAX_RETRIES + ' retries');
+    }
+
+    // Step 2: Fetch full transaction details to get PIN/voucher data
+    // Keep async status (most reliable) but merge supplemental data from GET
+    const txId = asyncResult.id;
+    if (txId) {
+      await sleep(2000);
+      try {
+        const fullTx = await this.sendRequest(`transactions/${txId}`, 'GET');
+        logger.info('DT-One full transaction fetched', { txId, hasPin: !!fullTx.pin, asyncStatus: asyncResult.status?.message, getStatus: fullTx.status?.message });
+        // Merge: use async status + GET supplemental data (pin, benefits, prices)
+        return {
+          ...asyncResult,
+          pin: fullTx.pin || asyncResult.pin || null,
+          benefits: fullTx.benefits || asyncResult.benefits || [],
+          prices: fullTx.prices || asyncResult.prices || null,
+        };
+      } catch (fetchErr) {
+        logger.warn('DT-One: could not fetch full transaction, using async response', { txId, error: fetchErr.message });
+      }
+    }
+
+    return asyncResult;
   }
 }
 

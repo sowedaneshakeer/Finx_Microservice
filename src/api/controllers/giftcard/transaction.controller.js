@@ -38,33 +38,66 @@ const createTransaction = async (req, res) => {
     // Pass all body params to the transaction service
     const result = await transactionService.createTransaction(req.body);
 
-    if (result.success) {
-      return res.json({
-        success: true,
-        data: {
-          transactionId: result.transactionId,
-          externalId: result.externalId,
-          status: result.status,
-          provider: providerName,
-          ...result.details
-        }
-      });
-    }
-
+    // Always return normalized data (same structure for success and failure)
     return res.json({
       success: true,
-      warning: 'UNUSUAL_TRANSACTION_STATUS',
-      data: result.rawResponse
+      ...(result.success ? {} : { warning: 'UNUSUAL_TRANSACTION_STATUS' }),
+      data: {
+        ...result.details,
+        // Normalized fields override raw provider response
+        transactionId: result.transactionId,
+        externalId: result.externalId,
+        status: result.status,
+        success: result.success,
+        provider: providerName,
+        final_amount: result.final_amount,
+        summary: result.summary,
+        operator: result.operator,
+        // PIN/voucher data (DT-One PIN_PURCHASE products)
+        pin: result.pin || null,
+        benefits: result.benefits || null,
+        prices: result.prices || null,
+        deliveryEmail: result.deliveryEmail || '',
+        // PPN-specific data
+        pins: result.pins || null,
+        giftCardDetail: result.giftCardDetail || null,
+        esimDetail: result.esimDetail || null,
+        topupDetail: result.topupDetail || null,
+        simInfo: result.simInfo || null,
+        billPaymentDetail: result.billPaymentDetail || null,
+        invoiceAmount: result.invoiceAmount || null,
+        faceValue: result.faceValue || null,
+        discount: result.discount || null,
+        fee: result.fee || null,
+        transactionDate: result.transactionDate || null,
+      }
     });
 
   } catch (error) {
-    logger.error('Transaction error:', { message: error.message, provider: req.body?.provider });
+    logger.error('Transaction error:', { message: error.message, provider: req.body?.provider, dtoneErrors: error.dtoneErrors || null, ppnCode: error.ppnResponseCode || null });
 
     let errorDetails;
     try {
       errorDetails = JSON.parse(error.message);
     } catch {
       errorDetails = { code: 'UNKNOWN_ERROR', message: error.message };
+    }
+
+    // PPN-specific error details
+    if (error.ppnResponseCode) {
+      errorDetails.code = `PPN_${error.ppnResponseCode}`;
+      errorDetails.message = error.ppnResponseMessage || errorDetails.message;
+    }
+
+    // Include provider-specific error details (DT-One errors, etc.)
+    const providerErrors = error.dtoneErrors || error.response?.data?.errors || error.response?.data || null;
+    if (providerErrors) {
+      errorDetails.providerErrors = providerErrors;
+      // Extract first meaningful error message from DT-One
+      if (Array.isArray(providerErrors) && providerErrors.length > 0) {
+        errorDetails.message = providerErrors[0].message || providerErrors[0].code || errorDetails.message;
+        errorDetails.code = providerErrors[0].code || errorDetails.code;
+      }
     }
 
     if (errorDetails.code === 'OUT_OF_STOCK') {
@@ -79,7 +112,7 @@ const createTransaction = async (req, res) => {
       success: false,
       error: errorDetails.code || 'TRANSACTION_FAILED',
       message: errorDetails.message,
-      ...(process.env.NODE_ENV === 'development' && { stack: error.stack })
+      providerErrors: providerErrors || undefined,
     });
   }
 };

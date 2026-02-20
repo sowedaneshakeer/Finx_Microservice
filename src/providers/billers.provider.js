@@ -16,6 +16,16 @@ class BillersProvider {
     this._ioCatalogCacheTTL = 30 * 60 * 1000; // 30 minutes
   }
 
+  async getBalance(currency = 'AED') {
+    try {
+      const response = await this.client.post('/balance', { Currency: currency });
+      return response.data;
+    } catch (error) {
+      logger.error('Billers getBalance Error:', { message: error.message, status: error.response?.status });
+      throw error;
+    }
+  }
+
   async getBillers(params = {}) {
     try {
       const response = await this.client.post('/billercatalog', params);
